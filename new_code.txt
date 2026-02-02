@@ -1,0 +1,122 @@
+template <typename Ftype>
+__device__ void scatterGPU_dev(
+    int iSt, int jSt,
+    Ftype *gemmBuff, int LDgemmBuff,
+    xlpanelGPU_t<Ftype>& lpanel, xupanelGPU_t<Ftype>& upanel,
+    xLUstructGPU_t<Ftype> *dA
+)
+{
+    int ii = iSt + blockIdx.x;
+    int jj = jSt + blockIdx.y;
+
+    int gi = lpanel.gid(ii);
+    int gj = upanel.gid(jj);
+
+    Ftype *Dst;
+    int_t lddst;
+    int_t dstRowLen, dstColLen;
+    int_t *dstRowList;
+    int_t *dstColList;
+    int li, lj;
+    if (gj > gi)
+    {
+        li = dA->g2lRow(gi);
+        lj = dA->uPanelVec[li].find(gj);
+        Dst = dA->uPanelVec[li].blkPtr(lj);
+        lddst = dA->supersize(gi);
+        dstRowLen = dA->supersize(gi);
+        dstRowList = NULL;
+        dstColLen = dA->uPanelVec[li].nbcol(lj);
+        dstColList = dA->uPanelVec[li].colList(lj);
+    }
+    else
+    {
+        lj = dA->g2lCol(gj);
+        li = dA->lPanelVec[lj].find(gi);
+        Dst = dA->lPanelVec[lj].blkPtr(li);
+        lddst = dA->lPanelVec[lj].LDA();
+        dstRowLen = dA->lPanelVec[lj].nbrow(li);
+        dstRowList = dA->lPanelVec[lj].rowList(li);
+        dstColLen = dA->supersize(gj);
+        dstColList = NULL;
+    }
+
+    int maxSuperSize = dA->maxSuperSize;
+    extern __shared__ int baseSharedPtr[];
+    int *rowS2D = baseSharedPtr;
+    int *colS2D = &rowS2D[maxSuperSize];
+    int *dstIdx = &colS2D[maxSuperSize];
+
+    int nrows = lpanel.nbrow(ii);
+    int ncols = upanel.nbcol(jj);
+
+    // ===== INLINED computeIndirectMapGPU for ROWS =====
+    {
+        int threadId = threadIdx.x;
+        if (dstRowList == NULL)
+        {
+            if (threadId < nrows)
+                rowS2D[threadId] = lpanel.rowList(ii)[threadId];
+            __syncthreads();
+        }
+        else
+        {
+            if (threadId < dstRowLen)
+                dstIdx[dstRowList[threadId]] = threadId;
+            __syncthreads();
+
+            if (threadId < nrows)
+                rowS2D[threadId] = dstIdx[lpanel.rowList(ii)[threadId]];
+            __syncthreads();
+        }
+    }
+
+    // ===== INLINED computeIndirectMapGPU for COLS =====
+    {
+        int threadId = threadIdx.x;
+        if (dstColList == NULL)
+        {
+            if (threadId < ncols)
+                colS2D[threadId] = upanel.colList(jj)[threadId];
+            __syncthreads();
+        }
+        else
+        {
+            if (threadId < dstColLen)
+                dstIdx[dstColList[threadId]] = threadId;
+            __syncthreads();
+
+            if (threadId < ncols)
+                colS2D[threadId] = dstIdx[upanel.colList(jj)[threadId]];
+            __syncthreads();
+        }
+    }
+
+    int threadId = threadIdx.x;
+    int nThreads = blockDim.x;
+    int colsPerThreadBlock = nThreads / nrows;
+
+    int rowOff = lpanel.stRow(ii) - lpanel.stRow(iSt);
+    int colOff = upanel.stCol(jj) - upanel.stCol(jSt);
+    Ftype *Src = &gemmBuff[rowOff + colOff * LDgemmBuff];
+    int ldsrc = LDgemmBuff;
+
+    if (threadId < nrows * colsPerThreadBlock)
+    {
+        int i = threadId % nrows;
+        int j = threadId / nrows;
+
+#pragma unroll 4
+        while (j < ncols)
+        {
+#ifdef ATOMIC_SCATTER
+            atomicAddT<Ftype>(&Dst[rowS2D[i] + lddst * colS2D[j]], -Src[i + ldsrc * j]);
+#else
+            Dst[rowS2D[i] + lddst * colS2D[j]] -= Src[i + ldsrc * j];
+#endif
+            j += colsPerThreadBlock;
+        }
+    }
+
+    __syncthreads();
+}
